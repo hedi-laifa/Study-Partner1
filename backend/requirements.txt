@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pydantic[email]
+pydantic-settings
+sqlalchemy
+alembic
+psycopg2-binary
+pgvector
+pymupdf
+sentence-transformers
+groq
