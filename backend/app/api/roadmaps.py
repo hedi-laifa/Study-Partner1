@@ -1,12 +1,14 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.models.roadmap_node import RoadmapNode
 from app.models.roadmap_node_progress import RoadmapNodeProgress
+from app.models.user import User
 from app.models.user_roadmap import UserRoadmap
 from app.services.roadmap_service import generate_roadmap_from_llm, persist_roadmap
 
@@ -14,14 +16,6 @@ router = APIRouter(tags=["roadmaps"])
 
 VALID_NODE_STATUSES = {"not-started", "in-progress", "completed", "known"}
 
-
-def _current_user_id(x_user_id: int = Header(...)) -> int:
-    return x_user_id
-
-
-# ---------------------------------------------------------------------------
-# Schemas
-# ---------------------------------------------------------------------------
 
 class GenerateRoadmapRequest(BaseModel):
     role: str
@@ -81,20 +75,21 @@ class PatchNodeStatusRequest(BaseModel):
     status: str
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
+# Roadmaps are shared/global resources — no per-user filtering needed here.
 
 @router.get("/roadmaps", response_model=list[RoadmapResponse])
-def list_roadmaps(db: Session = Depends(get_db)):
+def list_roadmaps(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     from app.models.roadmap import Roadmap
     return db.query(Roadmap).all()
 
 
 @router.get("/roadmaps/{roadmap_id}", response_model=RoadmapResponse)
-def get_roadmap(roadmap_id: str, db: Session = Depends(get_db)):
+def get_roadmap(
+    roadmap_id: str,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
     from app.models.roadmap import Roadmap
-    from app.models.roadmap_node import RoadmapNode
 
     r = None
     if roadmap_id.isdigit():
@@ -105,15 +100,13 @@ def get_roadmap(roadmap_id: str, db: Session = Depends(get_db)):
         r = db.query(Roadmap).filter(Roadmap.role.ilike(f"%{role_search}%")).first()
 
     if not r:
-        parts = roadmap_id.replace("-", " ").strip().split()
-        for p in parts:
+        for p in roadmap_id.replace("-", " ").strip().split():
             if len(p) > 3:
                 r = db.query(Roadmap).filter(Roadmap.role.ilike(f"%{p}%")).first()
                 if r:
                     break
 
     if not r:
-        # Fallback to first roadmap or auto-seed
         r = db.query(Roadmap).first()
 
     if not r:
@@ -125,7 +118,6 @@ def get_roadmap(roadmap_id: str, db: Session = Depends(get_db)):
         )
         db.add(r)
         db.flush()
-
         default_nodes = [
             ("Core Foundations", f"Essential fundamentals of {role_title}.", False),
             ("Key Tools & Frameworks", "Standard workflows and production toolsets.", False),
@@ -134,13 +126,7 @@ def get_roadmap(roadmap_id: str, db: Session = Depends(get_db)):
             ("Advanced Specialization", "Cutting-edge techniques and advanced topics.", True),
         ]
         for order, (t_title, t_desc, opt) in enumerate(default_nodes, start=1):
-            db.add(RoadmapNode(
-                roadmap_id=r.id,
-                title=t_title,
-                description=t_desc,
-                order=order,
-                optional=opt,
-            ))
+            db.add(RoadmapNode(roadmap_id=r.id, title=t_title, description=t_desc, order=order, optional=opt))
         db.commit()
         db.refresh(r)
 
@@ -151,17 +137,12 @@ def get_roadmap(roadmap_id: str, db: Session = Depends(get_db)):
 def create_roadmap(
     body: CreateRoadmapBody,
     db: Session = Depends(get_db),
-    user_id: int = Depends(_current_user_id),
+    _: User = Depends(get_current_user),
 ):
     from app.models.roadmap import Roadmap
-    from app.models.roadmap_node import RoadmapNode
 
     desc = body.goal or f"Learning path to become a {body.role}."
-    roadmap = Roadmap(
-        role=body.role,
-        description=desc,
-        source="AI-generated mock",
-    )
+    roadmap = Roadmap(role=body.role, description=desc, source="AI-generated mock")
     db.add(roadmap)
     db.flush()
 
@@ -172,13 +153,7 @@ def create_roadmap(
         ("Advanced Techniques", "Specialized patterns and optimization strategies.", True),
     ]
     for order, (t_title, t_desc, opt) in enumerate(default_topics, start=1):
-        db.add(RoadmapNode(
-            roadmap_id=roadmap.id,
-            title=t_title,
-            description=t_desc,
-            order=order,
-            optional=opt,
-        ))
+        db.add(RoadmapNode(roadmap_id=roadmap.id, title=t_title, description=t_desc, order=order, optional=opt))
 
     db.commit()
     db.refresh(roadmap)
@@ -189,7 +164,7 @@ def create_roadmap(
 def generate_roadmap(
     body: GenerateRoadmapRequest,
     db: Session = Depends(get_db),
-    _: int = Depends(_current_user_id),
+    _: User = Depends(get_current_user),
 ):
     schema = generate_roadmap_from_llm(body.role.strip())
     roadmap = persist_roadmap(db, schema)
@@ -202,7 +177,7 @@ def generate_roadmap(
 def enroll_roadmap(
     body: EnrollRoadmapRequest,
     db: Session = Depends(get_db),
-    user_id: int = Depends(_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
     from app.models.roadmap import Roadmap
 
@@ -210,11 +185,10 @@ def enroll_roadmap(
     if not roadmap:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Roadmap not found")
 
-    user_roadmap = UserRoadmap(user_id=user_id, roadmap_id=roadmap.id)
+    user_roadmap = UserRoadmap(user_id=current_user.id, roadmap_id=roadmap.id)
     db.add(user_roadmap)
     db.flush()
 
-    # Seed a RoadmapNodeProgress row for every node
     for node in roadmap.nodes:
         db.add(RoadmapNodeProgress(user_roadmap_id=user_roadmap.id, node_id=node.id, status="not-started"))
 
@@ -229,7 +203,7 @@ def update_node_status(
     node_id: int,
     body: PatchNodeStatusRequest,
     db: Session = Depends(get_db),
-    user_id: int = Depends(_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
     if body.status not in VALID_NODE_STATUSES:
         raise HTTPException(
@@ -237,37 +211,28 @@ def update_node_status(
             detail=f"status must be one of {sorted(VALID_NODE_STATUSES)}",
         )
 
-    user_roadmap = (
-        db.query(UserRoadmap)
-        .filter(UserRoadmap.id == user_roadmap_id, UserRoadmap.user_id == user_id)
-        .first()
-    )
+    user_roadmap = db.query(UserRoadmap).filter(
+        UserRoadmap.id == user_roadmap_id, UserRoadmap.user_id == current_user.id
+    ).first()
     if not user_roadmap:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="UserRoadmap not found")
 
     node = db.query(RoadmapNode).filter(
-        RoadmapNode.id == node_id,
-        RoadmapNode.roadmap_id == user_roadmap.roadmap_id,
+        RoadmapNode.id == node_id, RoadmapNode.roadmap_id == user_roadmap.roadmap_id
     ).first()
     if not node:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found in this roadmap")
 
-    node_prog = (
-        db.query(RoadmapNodeProgress)
-        .filter(
-            RoadmapNodeProgress.user_roadmap_id == user_roadmap_id,
-            RoadmapNodeProgress.node_id == node_id,
-        )
-        .first()
-    )
+    node_prog = db.query(RoadmapNodeProgress).filter(
+        RoadmapNodeProgress.user_roadmap_id == user_roadmap_id,
+        RoadmapNodeProgress.node_id == node_id,
+    ).first()
     if node_prog:
         node_prog.status = body.status
         node_prog.updated_at = datetime.now(timezone.utc)
     else:
         node_prog = RoadmapNodeProgress(
-            user_roadmap_id=user_roadmap_id,
-            node_id=node_id,
-            status=body.status,
+            user_roadmap_id=user_roadmap_id, node_id=node_id, status=body.status
         )
         db.add(node_prog)
 

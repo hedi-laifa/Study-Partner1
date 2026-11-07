@@ -22,7 +22,10 @@ const initialState: SessionControllerState = {
   summaryVisible: false,
 }
 
-export function useStudySessionController(session?: StudySessionDetail) {
+export function useStudySessionController(
+  session?: StudySessionDetail,
+  onSessionUpdate?: (updated: StudySessionDetail) => void
+) {
   const [state, setState] = useState<SessionControllerState>(() => readState(session?.id))
   const [evaluating, setEvaluating] = useState(false)
 
@@ -41,16 +44,39 @@ export function useStudySessionController(session?: StudySessionDetail) {
   async function submitAnswer() {
     if (!session || !question || !state.answer.trim() || evaluating) return
     setEvaluating(true)
+    const attemptCount = state.history.filter((record) => record.questionId === question.id).length
     try {
-      const feedback = await studySessionService.evaluateAnswer(session.id, question.id, state.history.filter((record) => record.questionId === question.id).length)
+      const feedback = await studySessionService.evaluateAnswer(
+        session.id,
+        question.id,
+        state.answer.trim(),
+        attemptCount
+      )
       setState((current) => ({
         ...current,
         feedback,
         submissionError: undefined,
-        history: [...current.history, { questionId: question.id, questionTopic: question.topic, answer: current.answer.trim(), feedback }],
+        history: [
+          ...current.history,
+          { questionId: question.id, questionTopic: question.topic, answer: current.answer.trim(), feedback },
+        ],
       }))
+
+      // Fetch the next AI-generated question from the backend
+      if (studySessionService.getNextQuestion && onSessionUpdate && session) {
+        const nextQ = await studySessionService.getNextQuestion(session.id, state.answer.trim())
+        if (nextQ) {
+          onSessionUpdate({
+            ...session,
+            questions: [...session.questions, nextQ],
+          })
+        }
+      }
     } catch {
-      setState((current) => ({ ...current, submissionError: 'The mock feedback could not be prepared. Please try submitting again.' }))
+      setState((current) => ({
+        ...current,
+        submissionError: 'The evaluation could not be completed. Please try submitting again.',
+      }))
     } finally {
       setEvaluating(false)
     }
@@ -65,7 +91,14 @@ export function useStudySessionController(session?: StudySessionDetail) {
       update({ summaryVisible: true })
       return
     }
-    update({ questionIndex: state.questionIndex + 1, answer: '', feedback: undefined, submissionError: undefined, hintLevel: 0, explanationVisible: false })
+    update({
+      questionIndex: state.questionIndex + 1,
+      answer: '',
+      feedback: undefined,
+      submissionError: undefined,
+      hintLevel: 0,
+      explanationVisible: false,
+    })
   }
 
   function requestHint() {
@@ -77,7 +110,9 @@ export function useStudySessionController(session?: StudySessionDetail) {
     return {
       strengths: unique(records.flatMap((record) => record.feedback.strengths)),
       gaps: unique(records.flatMap((record) => record.feedback.missingIdeas)),
-      revision: records.at(-1)?.feedback.nextActivity ?? 'Start with one short study activity and explain your reasoning out loud.',
+      revision:
+        records.at(-1)?.feedback.nextActivity ??
+        'Start with one short study activity and explain your reasoning out loud.',
     }
   }, [state.history])
 

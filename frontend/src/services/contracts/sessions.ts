@@ -54,5 +54,6 @@ export type AnswerRecord = {
 
 export interface StudySessionService {
   getSession(sessionId: string): Promise<StudySessionDetail | undefined>
-  evaluateAnswer(sessionId: string, questionId: string, attempt: number): Promise<StudyFeedback>
+  evaluateAnswer(sessionId: string, questionId: string, answer: string, attempt: number): Promise<StudyFeedback>
+  getNextQuestion?(sessionId: string, answer: string): Promise<StudyQuestion | null>
 }

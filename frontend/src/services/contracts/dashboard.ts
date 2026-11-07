@@ -2,11 +2,13 @@ import type { DashboardCourse, PracticeConcept, Roadmap, StudySession, WeeklyAct
 
 export type DashboardData = {
   greeting: { name: string; focus: string; recommendation: string }
+  streak: number
   courses: DashboardCourse[]
   concepts: PracticeConcept[]
   sessions: StudySession[]
   weeklyActivity: WeeklyActivity[]
-  roadmap: Roadmap
+  roadmap: Roadmap | null
+  nextExam: { id: string; title: string; duration: string } | null
   isFirstTime: boolean
 }
 

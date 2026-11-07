@@ -1,23 +1,21 @@
 import json
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.models.course import Course
 from app.models.exam_answer import ExamAnswer
 from app.models.exam_attempt import ExamAttempt
 from app.models.exam_question import ExamQuestion
 from app.models.practice_exam import PracticeExam
+from app.models.user import User
 from app.services.exam_service import assert_within_deadline, bulk_assess_attempt, generate_exam_questions
 
 router = APIRouter(tags=["exams"])
-
-
-def _uid(x_user_id: int | None = Header(None)) -> int:
-    return x_user_id or 1
 
 
 # ---------------------------------------------------------------------------
@@ -106,71 +104,37 @@ class SubmitExamAnswersBody(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Helper
+# Helper — always scoped to current user
 # ---------------------------------------------------------------------------
 
-def _find_or_create_exam(db: Session, exam_id: str, user_id: int) -> PracticeExam:
-    exam = None
+def _find_exam_for_user(db: Session, exam_id: str, user_id: int) -> PracticeExam | None:
+    """Return a PracticeExam belonging to this user, or None."""
     if exam_id.isdigit():
-        exam = db.query(PracticeExam).filter(PracticeExam.id == int(exam_id)).first()
-
-    if not exam:
-        title_search = exam_id.replace("-", " ").strip()
         exam = (
             db.query(PracticeExam)
             .join(Course)
-            .filter(Course.user_id == user_id, PracticeExam.title.ilike(f"%{title_search}%"))
+            .filter(PracticeExam.id == int(exam_id), Course.user_id == user_id)
             .first()
         )
+        if exam:
+            return exam
 
-    if not exam:
-        title_search = exam_id.replace("-", " ").strip()
-        exam = db.query(PracticeExam).filter(PracticeExam.title.ilike(f"%{title_search}%")).first()
+    title_search = exam_id.replace("-", " ").strip()
+    return (
+        db.query(PracticeExam)
+        .join(Course)
+        .filter(Course.user_id == user_id, PracticeExam.title.ilike(f"%{title_search}%"))
+        .first()
+    )
 
-    if not exam:
-        course = db.query(Course).filter(Course.user_id == user_id).first()
-        if not course:
-            course = Course(
-                user_id=user_id,
-                title="Foundational Architecture",
-                subject="Computer Science",
-                domain_type="Intermediate",
-            )
-            db.add(course)
-            db.commit()
-            db.refresh(course)
 
-        exam_title = exam_id.replace("-", " ").title()
-        exam = PracticeExam(
-            course_id=course.id,
-            title=exam_title,
-            time_limit_minutes=25,
-            question_count=5,
-            status="ready",
-        )
-        db.add(exam)
-        db.flush()
-
-        sample_q = [
-            ("multiple-choice", f"What is a primary principle in {exam_title}?", ["Modularity and separation of concerns", "Monolithic coupling", "Random mutation", "Manual memory management"]),
-            ("multiple-choice", "How should state and side-effects be managed?", ["Explicit lifecycle boundaries", "Global mutable variables", "Ignoring errors", "Unsynchronized threads"]),
-            ("multiple-choice", "Which practice ensures best maintainability?", ["Automated tests and clear abstractions", "No documentation", "Copying code", "Single huge files"]),
-            ("short-answer", f"Explain the key architectural challenge addressed by {exam_title}.", ["Maintainability, scalability, and testability across modules."]),
-        ]
-        for order, (qtype, prompt, opts) in enumerate(sample_q, start=1):
-            db.add(ExamQuestion(
-                exam_id=exam.id,
-                order=order,
-                type=qtype,
-                prompt=prompt,
-                options=json.dumps(opts) if qtype == "multiple-choice" else None,
-                correct_answer=opts[0],
-                explanation=f"Core principle of {opts[0]}.",
-            ))
-        db.commit()
-        db.refresh(exam)
-
-    return exam
+def _get_attempt_for_user(db: Session, attempt_id: int, user_id: int) -> ExamAttempt:
+    attempt = db.query(ExamAttempt).filter(
+        ExamAttempt.id == attempt_id, ExamAttempt.user_id == user_id
+    ).first()
+    if not attempt:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found")
+    return attempt
 
 
 # ---------------------------------------------------------------------------
@@ -181,9 +145,11 @@ def _find_or_create_exam(db: Session, exam_id: str, user_id: int) -> PracticeExa
 def create_exam(
     body: ExamCreate,
     db: Session = Depends(get_db),
-    user_id: int = Depends(_uid),
+    current_user: User = Depends(get_current_user),
 ):
-    course = db.query(Course).filter(Course.id == body.course_id).first()
+    course = db.query(Course).filter(
+        Course.id == body.course_id, Course.user_id == current_user.id
+    ).first()
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
 
@@ -215,9 +181,12 @@ def create_exam(
 def start_exam(
     exam_id: str,
     db: Session = Depends(get_db),
-    user_id: int = Depends(_uid),
+    current_user: User = Depends(get_current_user),
 ):
-    exam = _find_or_create_exam(db, exam_id, user_id)
+    exam = _find_exam_for_user(db, exam_id, current_user.id)
+    if not exam:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
+
     if exam.status != "ready":
         exam.status = "ready"
         db.commit()
@@ -225,7 +194,7 @@ def start_exam(
     now = datetime.now(timezone.utc)
     attempt = ExamAttempt(
         exam_id=exam.id,
-        user_id=user_id,
+        user_id=current_user.id,
         started_at=now,
         deadline_at=now + timedelta(minutes=exam.time_limit_minutes),
         status="in-progress",
@@ -254,23 +223,14 @@ def autosave_answer(
     question_id: int,
     body: AutosaveRequest,
     db: Session = Depends(get_db),
-    user_id: int = Depends(_uid),
+    current_user: User = Depends(get_current_user),
 ):
-    attempt = (
-        db.query(ExamAttempt)
-        .filter(ExamAttempt.id == attempt_id)
-        .first()
-    )
-    if not attempt:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found")
-
+    attempt = _get_attempt_for_user(db, attempt_id, current_user.id)
     assert_within_deadline(attempt)
 
-    answer = (
-        db.query(ExamAnswer)
-        .filter(ExamAnswer.attempt_id == attempt_id, ExamAnswer.question_id == question_id)
-        .first()
-    )
+    answer = db.query(ExamAnswer).filter(
+        ExamAnswer.attempt_id == attempt_id, ExamAnswer.question_id == question_id
+    ).first()
     now = datetime.now(timezone.utc)
     if answer:
         answer.answer_text = body.answer_text
@@ -294,13 +254,19 @@ def submit_exam_with_answers(
     exam_id: str,
     body: SubmitExamAnswersBody,
     db: Session = Depends(get_db),
-    user_id: int = Depends(_uid),
+    current_user: User = Depends(get_current_user),
 ):
-    exam = _find_or_create_exam(db, exam_id, user_id)
+    exam = _find_exam_for_user(db, exam_id, current_user.id)
+    if not exam:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
 
     attempt = (
         db.query(ExamAttempt)
-        .filter(ExamAttempt.exam_id == exam.id, ExamAttempt.user_id == user_id, ExamAttempt.status == "in-progress")
+        .filter(
+            ExamAttempt.exam_id == exam.id,
+            ExamAttempt.user_id == current_user.id,
+            ExamAttempt.status == "in-progress",
+        )
         .order_by(ExamAttempt.started_at.desc())
         .first()
     )
@@ -308,7 +274,7 @@ def submit_exam_with_answers(
     if not attempt:
         attempt = ExamAttempt(
             exam_id=exam.id,
-            user_id=user_id,
+            user_id=current_user.id,
             started_at=now,
             deadline_at=now + timedelta(minutes=exam.time_limit_minutes),
             status="in-progress",
@@ -320,17 +286,14 @@ def submit_exam_with_answers(
 
     for q in questions:
         ans_text = body.answers.get(str(q.id)) or body.answers.get(f"q_{q.id}") or ""
-        existing_ans = db.query(ExamAnswer).filter(ExamAnswer.attempt_id == attempt.id, ExamAnswer.question_id == q.id).first()
+        existing_ans = db.query(ExamAnswer).filter(
+            ExamAnswer.attempt_id == attempt.id, ExamAnswer.question_id == q.id
+        ).first()
         if existing_ans:
             existing_ans.answer_text = ans_text
             existing_ans.saved_at = now
         else:
-            db.add(ExamAnswer(
-                attempt_id=attempt.id,
-                question_id=q.id,
-                answer_text=ans_text,
-                saved_at=now,
-            ))
+            db.add(ExamAnswer(attempt_id=attempt.id, question_id=q.id, answer_text=ans_text, saved_at=now))
     db.flush()
 
     bulk_assess_attempt(db, attempt)
@@ -340,14 +303,13 @@ def submit_exam_with_answers(
     db.commit()
     db.refresh(attempt)
 
-    course_obj = db.get(Course, exam.course_id) if exam and exam.course_id else None
-    c_title = course_obj.title if course_obj else "Practice Course"
+    course_obj = db.get(Course, exam.course_id) if exam.course_id else None
 
     return ExamResultResponse(
         attempt_id=attempt.id,
         exam_id=exam.id,
         title=exam.title,
-        course=c_title,
+        course=course_obj.title if course_obj else "Practice Course",
         submitted_at=attempt.submitted_at,
         answers=[
             ExamResultAnswer(
@@ -357,7 +319,7 @@ def submit_exam_with_answers(
                 correct_answer=a.question.correct_answer if a.question else None,
                 verdict=a.verdict or "Needs review",
                 rubric_score=a.rubric_score,
-                feedback=a.feedback or f"Correct answer: {a.question.correct_answer if a.question else ''}",
+                feedback=a.feedback or (f"Correct answer: {a.question.correct_answer}" if a.question else ""),
             )
             for a in attempt.answers
         ],
@@ -368,16 +330,9 @@ def submit_exam_with_answers(
 def submit_attempt(
     attempt_id: int,
     db: Session = Depends(get_db),
-    user_id: int = Depends(_uid),
+    current_user: User = Depends(get_current_user),
 ):
-    attempt = (
-        db.query(ExamAttempt)
-        .filter(ExamAttempt.id == attempt_id)
-        .first()
-    )
-    if not attempt:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found")
-
+    attempt = _get_attempt_for_user(db, attempt_id, current_user.id)
     assert_within_deadline(attempt)
 
     bulk_assess_attempt(db, attempt)
@@ -387,20 +342,13 @@ def submit_attempt(
     db.commit()
     db.refresh(attempt)
 
-    answers = (
-        db.query(ExamAnswer)
-        .filter(ExamAnswer.attempt_id == attempt_id)
-        .all()
-    )
-
     course_obj = db.get(Course, attempt.exam.course_id) if (attempt.exam and attempt.exam.course_id) else None
-    c_title = course_obj.title if course_obj else "Practice Course"
 
     return ExamResultResponse(
         attempt_id=attempt.id,
         exam_id=attempt.exam_id,
         title=attempt.exam.title if attempt.exam else "Practice Exam",
-        course=c_title,
+        course=course_obj.title if course_obj else "Practice Course",
         submitted_at=attempt.submitted_at,
         answers=[
             ExamResultAnswer(
@@ -412,7 +360,7 @@ def submit_attempt(
                 rubric_score=a.rubric_score,
                 feedback=a.feedback,
             )
-            for a in answers
+            for a in attempt.answers
         ],
     )
 
@@ -420,27 +368,26 @@ def submit_attempt(
 @router.get("/exams", response_model=list[ExamResponse])
 def list_exams(
     db: Session = Depends(get_db),
-    user_id: int = Depends(_uid),
+    current_user: User = Depends(get_current_user),
 ):
-    # Return exams belonging to this user's courses
-    user_exams = (
+    return (
         db.query(PracticeExam)
         .join(Course)
-        .filter(Course.user_id == user_id)
+        .filter(Course.user_id == current_user.id)
         .all()
     )
-    if not user_exams:
-        user_exams = db.query(PracticeExam).limit(10).all()
-    return user_exams
 
 
 @router.get("/exams/{exam_id}", response_model=ExamResponse)
 def get_exam(
     exam_id: str,
     db: Session = Depends(get_db),
-    user_id: int = Depends(_uid),
+    current_user: User = Depends(get_current_user),
 ):
-    return _find_or_create_exam(db, exam_id, user_id)
+    exam = _find_exam_for_user(db, exam_id, current_user.id)
+    if not exam:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
+    return exam
 
 
 class ExamAttemptSummary(BaseModel):
@@ -458,31 +405,27 @@ class ExamAttemptSummary(BaseModel):
 @router.get("/exam-attempts", response_model=list[ExamAttemptSummary])
 def list_exam_attempts(
     db: Session = Depends(get_db),
-    user_id: int = Depends(_uid),
+    current_user: User = Depends(get_current_user),
 ):
     attempts = (
         db.query(ExamAttempt)
-        .filter(ExamAttempt.user_id == user_id)
+        .filter(ExamAttempt.user_id == current_user.id)
         .order_by(ExamAttempt.started_at.desc())
         .limit(20)
         .all()
     )
-    if not attempts:
-        # Fallback to general attempts so new users see examples of passed attempts
-        attempts = db.query(ExamAttempt).order_by(ExamAttempt.started_at.desc()).limit(5).all()
 
     results: list[ExamAttemptSummary] = []
     for at in attempts:
         total = len(at.answers) or (at.exam.question_count if at.exam else 5)
         correct = sum(1 for a in at.answers if a.verdict in ("Correct", "Partially correct"))
-        score_pct = int((correct / total) * 100) if total else 85
+        score_pct = int((correct / total) * 100) if total else 0
         course_obj = db.get(Course, at.exam.course_id) if (at.exam and at.exam.course_id) else None
-        c_title = course_obj.title if course_obj else "Practice Course"
         results.append(
             ExamAttemptSummary(
                 id=str(at.id),
                 title=at.exam.title if at.exam else "Practice Exam",
-                course=c_title,
+                course=course_obj.title if course_obj else "Practice Course",
                 date=at.started_at.strftime("%b %d") if at.started_at else "Recent",
                 duration=f"{at.exam.time_limit_minutes if at.exam else 25} min",
                 questionCount=total,
@@ -499,64 +442,45 @@ def list_exam_attempts(
 def get_exam_results(
     attempt_id: str,
     db: Session = Depends(get_db),
-    user_id: int = Depends(_uid),
+    current_user: User = Depends(get_current_user),
 ):
     attempt = None
     if attempt_id.isdigit():
         aid = int(attempt_id)
-        attempt = db.query(ExamAttempt).filter(ExamAttempt.id == aid).first()
+        attempt = db.query(ExamAttempt).filter(
+            ExamAttempt.id == aid, ExamAttempt.user_id == current_user.id
+        ).first()
         if not attempt:
+            # attempt_id might actually be an exam_id
             attempt = (
                 db.query(ExamAttempt)
-                .filter(ExamAttempt.exam_id == aid)
+                .join(PracticeExam, ExamAttempt.exam_id == PracticeExam.id)
+                .join(Course, PracticeExam.course_id == Course.id)
+                .filter(ExamAttempt.exam_id == aid, Course.user_id == current_user.id)
                 .order_by(ExamAttempt.started_at.desc())
                 .first()
             )
 
     if not attempt:
-        exam = _find_or_create_exam(db, attempt_id, user_id)
-        attempt = (
-            db.query(ExamAttempt)
-            .filter(ExamAttempt.exam_id == exam.id)
-            .order_by(ExamAttempt.started_at.desc())
-            .first()
-        )
+        exam = _find_exam_for_user(db, attempt_id, current_user.id)
+        if exam:
+            attempt = (
+                db.query(ExamAttempt)
+                .filter(ExamAttempt.exam_id == exam.id, ExamAttempt.user_id == current_user.id)
+                .order_by(ExamAttempt.started_at.desc())
+                .first()
+            )
 
     if not attempt:
-        exam = _find_or_create_exam(db, attempt_id, user_id)
-        now = datetime.now(timezone.utc)
-        attempt = ExamAttempt(
-            exam_id=exam.id,
-            user_id=user_id,
-            started_at=now,
-            deadline_at=now + timedelta(minutes=exam.time_limit_minutes),
-            status="submitted",
-            submitted_at=now,
-        )
-        db.add(attempt)
-        db.flush()
-        questions = db.query(ExamQuestion).filter(ExamQuestion.exam_id == exam.id).all()
-        for q in questions:
-            db.add(ExamAnswer(
-                attempt_id=attempt.id,
-                question_id=q.id,
-                answer_text=q.correct_answer or "Foundational concepts applied.",
-                saved_at=now,
-                verdict="Correct",
-                rubric_score=1.0,
-                feedback="Correct! You identified the primary principle.",
-            ))
-        db.commit()
-        db.refresh(attempt)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam results not found")
 
     course_obj = db.get(Course, attempt.exam.course_id) if (attempt.exam and attempt.exam.course_id) else None
-    c_title = course_obj.title if course_obj else "Practice Course"
 
     return ExamResultResponse(
         attempt_id=attempt.id,
         exam_id=attempt.exam_id,
         title=attempt.exam.title if attempt.exam else "Practice Exam",
-        course=c_title,
+        course=course_obj.title if course_obj else "Practice Course",
         submitted_at=attempt.submitted_at or attempt.started_at,
         answers=[
             ExamResultAnswer(

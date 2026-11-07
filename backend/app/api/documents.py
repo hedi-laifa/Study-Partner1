@@ -1,15 +1,17 @@
 import shutil
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Header, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.chunk import Chunk
 from app.models.course import Course
 from app.models.document import Document
+from app.models.user import User
 from app.services.chunker import chunk_pages
 from app.services.document_explainer import explain_and_summarize_document
 from app.services.embedder import embed_texts
@@ -21,22 +23,25 @@ router = APIRouter(prefix="/courses", tags=["documents"])
 ALLOWED_CONTENT_TYPES = {"application/pdf"}
 
 
-def _current_user_id(x_user_id: int | None = Header(None)) -> int:
-    return x_user_id or 1
-
-
 def _find_course(db: Session, course_id: str, user_id: int) -> Course | None:
     if course_id.isdigit():
         c = db.query(Course).filter(Course.id == int(course_id), Course.user_id == user_id).first()
         if c:
             return c
     title_search = course_id.replace("-", " ").strip()
-    c = db.query(Course).filter(Course.user_id == user_id, Course.title.ilike(f"%{title_search}%")).first()
-    if c:
-        return c
-    if course_id.isdigit():
-        return db.get(Course, int(course_id))
-    return None
+    return db.query(Course).filter(Course.user_id == user_id, Course.title.ilike(f"%{title_search}%")).first()
+
+
+def _get_doc_for_user(db: Session, document_id: int, user_id: int) -> Document:
+    doc = (
+        db.query(Document)
+        .join(Course, Document.course_id == Course.id)
+        .filter(Document.id == document_id, Course.user_id == user_id)
+        .first()
+    )
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    return doc
 
 
 class DocumentChatRequest(BaseModel):
@@ -48,8 +53,9 @@ def upload_document(
     course_id: str,
     file: UploadFile,
     db: Session = Depends(get_db),
-    user_id: int = Depends(_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.id
     if file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Only PDF files are accepted")
 
@@ -130,8 +136,9 @@ def upload_document(
 def list_documents(
     course_id: str,
     db: Session = Depends(get_db),
-    user_id: int = Depends(_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.id
     course = _find_course(db, course_id, user_id)
     if not course:
         return []
@@ -158,11 +165,9 @@ def get_document_explanation(
     course_id: str,
     document_id: int,
     db: Session = Depends(get_db),
-    user_id: int = Depends(_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
-    doc = db.query(Document).filter(Document.id == document_id).first()
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    doc = _get_doc_for_user(db, document_id, current_user.id)
 
     result = explain_and_summarize_document(db, doc)
     return {
@@ -182,11 +187,9 @@ def chat_document(
     document_id: int,
     body: DocumentChatRequest,
     db: Session = Depends(get_db),
-    user_id: int = Depends(_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
-    doc = db.query(Document).filter(Document.id == document_id).first()
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    doc = _get_doc_for_user(db, document_id, current_user.id)
 
     chunks = [c.text for c in doc.chunks if c.text][:8]
     if not chunks:
@@ -201,11 +204,9 @@ def delete_document(
     course_id: str,
     document_id: int,
     db: Session = Depends(get_db),
-    user_id: int = Depends(_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
-    doc = db.query(Document).filter(Document.id == document_id).first()
-    if not doc:
-        return {"status": "ok"}
+    doc = _get_doc_for_user(db, document_id, current_user.id)
     db.delete(doc)
     db.commit()
     return {"status": "ok"}

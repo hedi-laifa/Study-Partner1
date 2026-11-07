@@ -1,10 +1,12 @@
 from datetime import date
 
-from fastapi import APIRouter, Depends, Header, Query
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_current_user
 from app.core.database import get_db
+from app.models.user import User
 from app.services.dashboard_service import (
     ActivityDay,
     ConceptSummary,
@@ -18,14 +20,6 @@ from app.services.dashboard_service import (
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
-
-def _uid(x_user_id: int = Header(...)) -> int:
-    return x_user_id
-
-
-# ---------------------------------------------------------------------------
-# Response schemas
-# ---------------------------------------------------------------------------
 
 class StreakResponse(BaseModel):
     current_streak: int
@@ -70,17 +64,13 @@ class ActivityDayResponse(BaseModel):
     questions_answered: int
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-
 @router.get("", response_model=DashboardResponse)
 def dashboard(
     timezone: str = Query(default="UTC", alias="tz"),
     db: Session = Depends(get_db),
-    user_id: int = Depends(_uid),
+    current_user: User = Depends(get_current_user),
 ):
-    data: DashboardData = get_dashboard(db, user_id, tz_name=timezone)
+    data: DashboardData = get_dashboard(db, current_user.id, tz_name=timezone)
 
     return DashboardResponse(
         streak=StreakResponse(
@@ -126,9 +116,9 @@ def activity_log(
     days: int = Query(default=30, ge=1, le=365),
     timezone: str = Query(default="UTC", alias="tz"),
     db: Session = Depends(get_db),
-    user_id: int = Depends(_uid),
+    current_user: User = Depends(get_current_user),
 ):
-    rows = get_activity_log(db, user_id, days=days, tz_name=timezone)
+    rows = get_activity_log(db, current_user.id, days=days, tz_name=timezone)
     return [
         ActivityDayResponse(
             date=r.date,

@@ -11,7 +11,7 @@ import type { StudySessionDetail } from '../services/contracts/sessions'
 export function StudySessionPage() {
   const { sessionId } = useParams()
   const navigate = useNavigate()
-  const [session, setSession] = useState<StudySessionDetail>()
+  const [session, setSession] = useState<StudySessionDetail | undefined>()
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState(false)
 
@@ -36,11 +36,18 @@ export function StudySessionPage() {
   if (loadError) return <EmptyState title="This session could not load" text="Your local session state is safe. Return to your course and try again." />
   if (!session) return <EmptyState title="Session not found" text="This study session is no longer available." />
 
-  return <StudySessionWorkspace key={session.id} session={session} onExit={() => navigate(session.courseId ? `/courses/${session.courseId}` : '/courses')} />
+  return (
+    <StudySessionWorkspace
+      key={session.id}
+      session={session}
+      onSessionUpdate={setSession}
+      onExit={() => navigate(session.courseId ? `/courses/${session.courseId}` : '/courses')}
+    />
+  )
 }
 
-function StudySessionWorkspace({ session, onExit }: { session: StudySessionDetail; onExit: () => void }) {
-  const controller = useStudySessionController(session)
+function StudySessionWorkspace({ session, onExit, onSessionUpdate }: { session: StudySessionDetail; onExit: () => void; onSessionUpdate?: (updated: StudySessionDetail) => void }) {
+  const controller = useStudySessionController(session, onSessionUpdate)
   const { state, question, progress, isLastQuestion, evaluating, update, submitAnswer, retry, continueToNext, requestHint, summary } = controller
   const [abandonOpen, setAbandonOpen] = useState(false)
   if (!question) return <EmptyState title="No activities yet" text="This session does not have any questions to work through." />
@@ -67,7 +74,7 @@ function StudySessionWorkspace({ session, onExit }: { session: StudySessionDetai
         <h1 id="study-question">{question.prompt}</h1>
           {question.context && <p className="question-context">{question.context}</p>}
           <label className="answer-editor"><span>Your answer</span><textarea value={state.answer} disabled={Boolean(state.feedback)} onChange={(event) => update({ answer: event.target.value })} placeholder="Write what you think, in your own words…" rows={7} /></label>
-          <div className="answer-footer"><span>{state.feedback ? 'Answer submitted' : `${state.answer.length} characters`}</span>{state.feedback ? <Button variant="secondary" onClick={retry}><RotateCcw size={15} /> Retry this question</Button> : <Button onClick={() => void submitAnswer()} disabled={!state.answer.trim() || evaluating}>{evaluating ? 'Checking mock scenario…' : <><Send size={15} /> Submit answer</>}</Button>}</div>
+          <div className="answer-footer"><span>{state.feedback ? 'Answer submitted' : `${state.answer.length} characters`}</span>{state.feedback ? <Button variant="secondary" onClick={retry}><RotateCcw size={15} /> Retry this question</Button> : <Button onClick={() => void submitAnswer()} disabled={!state.answer.trim() || evaluating}>{evaluating ? 'Evaluating…' : <><Send size={15} /> Submit answer</>}</Button>}</div>
           {state.submissionError && <p className="submission-error" role="alert"><AlertCircle size={15} /> {state.submissionError}</p>}
           {state.feedback && <FeedbackPanel feedback={state.feedback} />}
         </section>

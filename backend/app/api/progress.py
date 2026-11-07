@@ -1,8 +1,10 @@
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends, Header
+
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.models.activity import Activity
 from app.models.attempt import Attempt
@@ -12,12 +14,9 @@ from app.models.course import Course
 from app.models.daily_activity import DailyActivity
 from app.models.evaluation import Evaluation
 from app.models.study_session import StudySession
+from app.models.user import User
 
 router = APIRouter(prefix="/progress", tags=["progress"])
-
-
-def _current_user_id(x_user_id: int = Header(...)) -> int:
-    return x_user_id
 
 
 class ProgressAttemptSchema(BaseModel):
@@ -54,13 +53,6 @@ class ProgressSessionSchema(BaseModel):
     completed: bool
 
 
-class WeeklyProgressSchema(BaseModel):
-    day: str
-    sessions: number = 0  # will be int
-    questions: number = 0  # will be int
-    minutes: number = 0  # will be int
-
-
 class ProgressResponse(BaseModel):
     studyMinutes: int
     sessionsCompleted: int
@@ -74,9 +66,9 @@ def _map_status(raw_status: str, estimate: float) -> str:
     s = (raw_status or "").lower()
     if "good" in s or estimate >= 0.75:
         return "Good evidence"
-    if "developing" in s or (estimate >= 0.4 and estimate < 0.75):
+    if "developing" in s or (0.4 <= estimate < 0.75):
         return "Developing"
-    if "practice" in s or (estimate > 0 and estimate < 0.4):
+    if "practice" in s or (0 < estimate < 0.4):
         return "Needs practice"
     return "Not enough evidence"
 
@@ -84,17 +76,15 @@ def _map_status(raw_status: str, estimate: float) -> str:
 @router.get("", response_model=ProgressResponse)
 def get_progress(
     db: Session = Depends(get_db),
-    user_id: int = Depends(_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
-    # 1. User courses
-    courses = db.query(Course).filter(Course.user_id == user_id).all()
+    courses = db.query(Course).filter(Course.user_id == current_user.id).all()
     course_map = {c.id: c for c in courses}
     course_ids = list(course_map.keys())
 
-    # 2. Daily activity / study minutes
     daily_rows = (
         db.query(DailyActivity)
-        .filter(DailyActivity.user_id == user_id)
+        .filter(DailyActivity.user_id == current_user.id)
         .order_by(DailyActivity.date.desc())
         .limit(30)
         .all()
@@ -102,7 +92,6 @@ def get_progress(
     total_questions = sum(d.questions_answered for d in daily_rows)
     total_activities = sum(d.activities_completed for d in daily_rows)
 
-    # 3. User sessions
     sessions = []
     if course_ids:
         sessions = (
@@ -114,7 +103,6 @@ def get_progress(
         )
 
     completed_sessions_count = sum(1 for s in sessions if s.status == "completed")
-    # If daily activities didn't record yet, compute from sessions & attempts
     total_attempts_count = 0
     if course_ids:
         total_attempts_count = (
@@ -128,7 +116,6 @@ def get_progress(
     questions_count = max(total_questions, total_attempts_count)
     study_minutes = max(total_activities * 15, len(sessions) * 20, 25 if questions_count > 0 else 0)
 
-    # 4. Concepts & ConceptProgress
     concepts_list: list[ProgressConceptSchema] = []
     if course_ids:
         all_concepts = db.query(Concept).filter(Concept.course_id.in_(course_ids)).all()
@@ -142,7 +129,6 @@ def get_progress(
             course_obj = course_map.get(cp.course_id)
             course_title = course_obj.title if course_obj else "General"
 
-            # Check attempts linked to this concept
             linked_activities = db.query(Activity).filter(Activity.concept_id == cp.id).all()
             act_ids = [a.id for a in linked_activities]
             attempts_schema: list[ProgressAttemptSchema] = []
@@ -198,7 +184,6 @@ def get_progress(
                 )
             )
 
-    # 5. Recent sessions schema
     recent_sessions_schema: list[ProgressSessionSchema] = []
     for s in sessions:
         c_obj = course_map.get(s.course_id)
@@ -216,7 +201,6 @@ def get_progress(
             )
         )
 
-    # 6. Weekly Activity (Last 7 days)
     today = datetime.now(timezone.utc).date()
     days_map = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
     weekly_activity = []
@@ -224,13 +208,11 @@ def get_progress(
         d = today - timedelta(days=i)
         day_name = days_map[d.weekday()]
         act_row = next((r for r in daily_rows if r.date == d), None)
-        q_count = act_row.questions_answered if act_row else 0
-        s_count = act_row.activities_completed if act_row else 0
         weekly_activity.append({
             "day": day_name,
-            "questions": q_count,
-            "sessions": s_count,
-            "minutes": s_count * 15,
+            "questions": act_row.questions_answered if act_row else 0,
+            "sessions": act_row.activities_completed if act_row else 0,
+            "minutes": (act_row.activities_completed if act_row else 0) * 15,
         })
 
     return ProgressResponse(

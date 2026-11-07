@@ -9,3 +9,4 @@ pgvector
 pymupdf
 sentence-transformers
 groq
+python-jose[cryptography]
